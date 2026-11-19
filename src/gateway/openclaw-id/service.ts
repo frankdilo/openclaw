@@ -40,11 +40,13 @@ import { appliedConfigKey, resolveSettings, sameSettings } from "./service-setti
 import { openClawIdTunnelStatus, type OpenClawIdStatus } from "./service-status.js";
 import { createTokenBindingPublisher } from "./service-token-bindings.js";
 import { createTunnelPrincipalPublisher } from "./service-tunnel-principals.js";
+import { createServiceUnlink } from "./service-unlink.js";
 import {
   isOpenClawIdTunnelPrincipalAdmitted,
   notifyOpenClawIdTunnelPrincipalsChanged,
 } from "./tunnel-principal.js";
 import type { TunnelRuntime } from "./tunnel-runtime.js";
+import { pendingUnlinkHosts } from "./unlink-operations.js";
 
 /** Side effects of membership changes that other Gateway owners perform. */
 export type OpenClawIdEffects = {
@@ -260,6 +262,8 @@ export function createOpenClawIdService(params: {
     await owner.initializeMemberProfileRoles();
     localPrincipals.publish();
     await armOwnerExpiry(owner);
+    // Pending unlinks go out even before remote access starts.
+    unlinkSteps.resume();
     const settings = resolveSettings(config, params.getStateDir());
     if ("missing" in settings) {
       await stopRuntime();
@@ -518,6 +522,7 @@ export function createOpenClawIdService(params: {
   // Only disabling the feature or closing this Gateway ends its local membership source.
   const stopLocalAuthority = () => {
     rebindOwner.stop();
+    unlinkSteps.stop();
     ownerExpiry.stop();
     peopleExpiry.stop();
     stopAuthorityChanges?.();
@@ -651,15 +656,16 @@ export function createOpenClawIdService(params: {
   });
 
   const restartForRebind = () => stopRuntime().then(reconcile);
-  const rebindOwner = createServiceRebindOwner({
+  const machine = {
     ...params,
     getAuthority,
     gatewayKey,
     enabled,
-    holdCode: rebindPublication.hold,
     restartRemoteAccess: () =>
       (queue = queue.then(restartForRebind, restartForRebind)).then(() => status),
-  });
+  };
+  const rebindOwner = createServiceRebindOwner({ ...machine, holdCode: rebindPublication.hold });
+  const unlinkSteps = createServiceUnlink({ ...machine, applyEvents });
 
   localPrincipals.publish();
 
@@ -702,7 +708,7 @@ export function createOpenClawIdService(params: {
       const record = await (await getAuthority()).load();
       const state = record?.authority;
       if (!record || !state) {
-        return { linked: false as const };
+        return { linked: false as const, ...pendingUnlinkHosts(record) };
       }
       return {
         linked: true as const,
@@ -785,6 +791,9 @@ export function createOpenClawIdService(params: {
     },
 
     rebind: rebindOwner.run,
+
+    /** Unlink from OpenClaw ID on this computer: the warning's counts, and the unlink itself. */
+    unlink: unlinkSteps,
 
     /** Retries publication with a code (after linking, or `needs_link_code`) held until success. */
     async publish(enrollmentCode?: string): Promise<PublishOutcome | undefined> {
